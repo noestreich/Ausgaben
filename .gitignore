@@ -1,0 +1,10 @@
+# Temporäre Diagnosedatei
+check.php
+
+# macOS
+.DS_Store
+
+# IDE
+.claude/
+.idea/
+*.swp
