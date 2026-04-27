@@ -433,8 +433,75 @@ foreach ($imageFiles as $img) {
     $pdf->addImagePage($imgPath, $img['mime']);
 }
 
-// Hinweis: PDF-Belege werden NICHT hier eingebettet, sondern erst nach dem
-// Briefbogen-Overlay in Schritt 3 – jedes PDF in seiner eigenen FPDI-Instanz.
+// ── PDF-Belege anhängen ───────────────────────────────────────────────────────
+// Strategie: FPDI zuerst (vektortreu, aber nur für PDF ≤ 1.4 ohne Xref-Streams).
+// Falls FPDI scheitert (modernes PDF 1.5+ mit komprimierten Xref-Tabellen),
+// Imagick als Fallback: Seiten zu JPEG rastern und als Bildseiten einbetten.
+
+foreach ($pdfFiles as $receiptPath) {
+    $handled = false;
+
+    // ── Methode 1: FPDI ───────────────────────────────────────────────────────
+    if (!$handled) {
+        try {
+            $pageCount = $pdf->setSourceFile($receiptPath);
+            for ($p = 1; $p <= $pageCount; $p++) {
+                $tpl  = $pdf->importPage($p);
+                $size = $pdf->getTemplateSize($tpl);
+                $pdf->AddPage($size['orientation'], [$size['width'], $size['height']]);
+                $pdf->useTemplate($tpl, 0, 0, $size['width'], $size['height']);
+            }
+            $handled = true;
+        } catch (Exception $e) {
+            // FPDI kann dieses PDF nicht lesen (vermutlich PDF 1.5+) → Imagick
+        }
+    }
+
+    // ── Methode 2: Imagick (PDF → JPEG) ──────────────────────────────────────
+    if (!$handled && class_exists('Imagick')) {
+        try {
+            $im = new Imagick();
+            $im->setResolution(150, 150);
+            $im->readImage($receiptPath);
+            $numPages = $im->getNumberImages();
+
+            for ($pi = 0; $pi < $numPages; $pi++) {
+                $im->setIteratorIndex($pi);
+                $page = $im->getImage();
+
+                // Transparenz auf weißen Hintergrund setzen
+                $bg = new Imagick();
+                $bg->newImage($page->getImageWidth(), $page->getImageHeight(),
+                              new ImagickPixel('white'));
+                $bg->setImageColorspace(Imagick::COLORSPACE_SRGB);
+                $bg->compositeImage($page, Imagick::COMPOSITE_OVER, 0, 0);
+                $bg->setImageFormat('jpeg');
+                $bg->setImageCompression(Imagick::COMPRESSION_JPEG);
+                $bg->setImageCompressionQuality(85);
+
+                $imgPath = $tmpDir . '/pdfimg_' . $pi . '_' . uniqid() . '.jpg';
+                $bg->writeImage($imgPath);
+                $bg->destroy();
+                $page->destroy();
+
+                $pdf->addImagePage($imgPath, 'image/jpeg');
+            }
+            $im->destroy();
+            $handled = true;
+        } catch (Exception $e) {
+            // Imagick auch gescheitert (kein Ghostscript o.ä.)
+        }
+    }
+
+    // ── Fallback: Platzhalterseite ────────────────────────────────────────────
+    if (!$handled) {
+        $pdf->AddPage('P', [210, 297]);
+        $pdf->SetFont('Helvetica', '', 10);
+        $pdf->SetTextColor(150, 150, 150);
+        $pdf->SetXY(15, 130);
+        $pdf->Cell(180, 8, iso('Beleg (PDF) konnte nicht eingebettet werden.'), 0, 1, 'C');
+    }
+}
 
 $rawPdf = $pdf->Output('S');
 
@@ -482,59 +549,6 @@ if (file_exists($briefbogenPath)) {
     } catch (Exception $e) {
         // Fehler beim Overlay → trotzdem das Roh-PDF ausliefern
         $finalPdf = $rawPdf;
-    }
-}
-
-// ── Schritt 3: PDF-Belege einzeln anhängen ───────────────────────────────────
-// Jedes Receipt-PDF bekommt seine eigene frische FPDI-Instanz, die genau zwei
-// Source-Files verarbeitet: das bisher aufgebaute finalPdf + das Receipt-PDF.
-// Damit vermeiden wir Konflikte beim gleichzeitigen Einlesen mehrerer PDFs in
-// einer einzigen FPDI-Instanz (wie es in Step 1 der Fall war).
-
-foreach ($pdfFiles as $receiptPath) {
-    try {
-        $chainPath = $tmpDir . '/chain_' . uniqid() . '.pdf';
-        file_put_contents($chainPath, $finalPdf);
-
-        $chain = new Fpdi();
-        $chain->SetMargins(0, 0, 0);
-        $chain->SetAutoPageBreak(false);
-
-        // Alle Seiten des aktuellen Ergebnis-PDFs importieren
-        $numCurrent = $chain->setSourceFile($chainPath);
-        $currentTpls = [];
-        for ($p = 1; $p <= $numCurrent; $p++) {
-            $currentTpls[$p] = $chain->importPage($p);
-        }
-
-        // Alle Seiten des Belegs importieren
-        $numReceipt = $chain->setSourceFile($receiptPath);
-        $receiptTpls = [];
-        for ($p = 1; $p <= $numReceipt; $p++) {
-            $receiptTpls[$p] = $chain->importPage($p);
-        }
-
-        // Vorhandene Seiten rendern
-        for ($p = 1; $p <= $numCurrent; $p++) {
-            $size = $chain->getTemplateSize($currentTpls[$p]);
-            $chain->AddPage($size['orientation'], [$size['width'], $size['height']]);
-            $chain->useTemplate($currentTpls[$p], 0, 0, $size['width'], $size['height']);
-        }
-
-        // Beleg-Seiten anhängen
-        for ($p = 1; $p <= $numReceipt; $p++) {
-            $size = $chain->getTemplateSize($receiptTpls[$p]);
-            $chain->AddPage($size['orientation'], [$size['width'], $size['height']]);
-            $chain->useTemplate($receiptTpls[$p], 0, 0, $size['width'], $size['height']);
-        }
-
-        $finalPdf = $chain->Output('S');
-    } catch (Exception $e) {
-        // Diesen Beleg überspringen, wenn er nicht verarbeitet werden kann
-    } finally {
-        if (isset($chainPath) && file_exists($chainPath)) {
-            unlink($chainPath);
-        }
     }
 }
 
